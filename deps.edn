@@ -1,0 +1,8 @@
+{:deps {fmnoise/flow {:mvn/version "4.3.0"}
+        metosin/malli {:mvn/version "0.20.1"}}
+ :paths ["src" "resources"]
+ :aliases
+ {:dev {:extra-deps {org.clojure/clojure {:mvn/version "1.12.0"}}
+        :extra-paths ["test"]}
+  :cider {:extra-deps {cider/cider-nrepl {:mvn/version "0.55.0"}}
+          :main-opts ["-m" "nrepl.cmdline" "--middleware" "[cider.nrepl/cider-middleware]"]}}}

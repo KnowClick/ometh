@@ -170,7 +170,7 @@ The above definition of `request-booking` requires callers to call `o/effects!`.
 
 (o/register-event! env* ::request-booking {::o/impl #'request-booking})
 
-(o/handle-event! env* {::o/event ::request-booking
+(o/handle-event! @env* {::o/event ::request-booking
                        ::o/params {:user-id user-id :appointment-window 'whatever}})
 
 ```
@@ -215,7 +215,7 @@ So far we've been invoking and defining events and effects the verbose way. Ther
                         {:on-success (->notify-user {:kind :success})
                          :on-error   (->notify-user {:kind :failed})})))
 
-(o/handle-event! env* (->request-booking {:user-id user-id :appointment-window 'whatever}))
+(o/handle-event! @env* (->request-booking {:user-id user-id :appointment-window 'whatever}))
 
 ```
 
@@ -265,8 +265,8 @@ Here's `request-booking` using Ometh queries:
   )
 
 (o/defevent request-booking
-  ::o/queries {:payments-up-to-date (fn [{:keys [user-id]}]
-                                      (->user-payments-up-to-date? user-id))}
+  {::o/queries {:payments-up-to-date (fn [{:keys [user-id]}]
+                                       (->user-payments-up-to-date? user-id))}}
   [env {:keys [user-id appointment-window]} {:keys [payments-up-to-date]}]
   (cond
     (not payments-up-to-date)
@@ -284,7 +284,7 @@ Here's `request-booking` using Ometh queries:
                         {:on-success (->notify-user {:kind :success})
                          :on-error   (->notify-user {:kind :failed})})))
 
-(o/handle-event! env* (->request-booking {:user-id user-id :appointment-window 'whatever}))
+(o/handle-event! @env* (->request-booking {:user-id user-id :appointment-window 'whatever}))
 
 ```
 
@@ -298,21 +298,22 @@ Another option is to return an event invocation anywhere we would otherwise have
 
 ```clojure
 (o/defevent request-booking-2
-  ::o/queries {:open (fn [{:keys [appointment-window]}]
-                       (->appointment-window-open? appointment-window))}
+  {::o/queries {:open (fn [{:keys [appointment-window]}]
+                        (->appointment-window-open? appointment-window))}}
   [env {:keys [user-id appointment-window]} {:keys [open]}]
-  (not open)
-  (->notify-user {:kind :unavailable})
+  (cond
+    (not open)
+    (->notify-user {:kind :unavailable})
 
-  :else
-  (->book-appointment {:user-id user-id
-                       :appointment-window appointment-window}
-                      {:on-success (->notify-user {:kind :success})
-                       :on-error   (->notify-user {:kind :failed})}))
+    :else
+    (->book-appointment {:user-id user-id
+                         :appointment-window appointment-window}
+                        {:on-success (->notify-user {:kind :success})
+                         :on-error   (->notify-user {:kind :failed})})))
 
 (o/defevent request-booking
-  ::o/queries {:payments-up-to-date (fn [{:keys [user-id]}]
-                                      (->user-payments-up-to-date? user-id))}
+  {::o/queries {:payments-up-to-date (fn [{:keys [user-id]}]
+                                       (->user-payments-up-to-date? user-id))}}
   [env {:keys [user-id appointment-window]} {:keys [payments-up-to-date]}]
   (cond
     (not payments-up-to-date)

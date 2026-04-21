@@ -117,31 +117,17 @@
 
 (def ^:private ^:dynamic *pending-invocations* #{})
 
-(defn make-env
-  "Construct an environment containing the given effects, queries, and events."
-  [& {:keys [effects queries events]}]
-  {::effect (or effects {})
-   ::query  (or queries  {})
-   ::event  (or events {})})
-
-(declare handle-event! effect!)
-
-(def default-effects
-  {::event {;; ::params-schema EventInvocation ;; todo
-            ::impl (fn [env event _] (handle-event! env event))}
-   ::noop  {::impl (constantly nil)}})
-
-(defn make-default-env
-  "Construct an environment containing the default effects, queries, and events."
-  [& {:keys [effects queries events] :as opts}]
-  (make-env (update opts :effects merge default-effects)))
-
-(def default-env*
-  "An atom containing the default environment.
-  This is the atom mutated by default when registering effects, queries, and events."
-  (atom (make-default-env)))
+(declare default-env*)
 
 ;; -- Queries --
+
+(defn- add-query-invocation-explainer [query-def]
+  (let [invocation-schema (m/schema ::QueryInvocation {:registry full-malli-registry})
+        invocation-explainer (m/explainer
+                              (if-let [p (::params-schema query-def)]
+                                (mu/merge invocation-schema (m/schema p))
+                                invocation-schema))]
+    (assoc query-def ::explainer invocation-explainer)))
 
 (defn register-query
   "Add a query to `env`"
@@ -149,13 +135,7 @@
   (when *check-definition-schemas*
     (when-let [explain (explain-query-definition m)]
       (throw (ex-info "Invalid query definition" explain))))
-  (let [invocation-schema (m/schema ::QueryInvocation {:registry full-malli-registry})
-        invocation-explainer (m/explainer
-                              (if-let [p (::params-schema m)]
-                                (mu/merge invocation-schema (m/schema p))
-                                invocation-schema))]
-    (register env ::query name
-              (assoc m ::explainer invocation-explainer))))
+  (register env ::query name (-> m (add-query-invocation-explainer))))
 
 (defn register-query!
   "Add a query to `env*`."
@@ -190,7 +170,7 @@
    (let [query-id (::query query-invocation)
          query-def (get-query env query-id)
          _ (when *check-invocation-schemas*
-             (when-let [explain ((::explainer query-def) query-invocation)]
+             (when-let [explain (when-let [f (::explainer query-def)] (f query-invocation))]
                (throw (ex-info "Invalid query invocation" explain))))
          impl      (::impl query-def)
          params    (::params query-invocation)]
@@ -219,19 +199,21 @@
 
 ;; -- Effects --
 
+(defn- add-effect-invocation-explainer [effect-def]
+  (let [invocation-schema (m/schema ::EffectInvocation {:registry full-malli-registry})
+        invocation-explainer (m/explainer
+                              (if-let [p (::params-schema effect-def)]
+                                (mu/merge invocation-schema (m/schema p))
+                                invocation-schema))]
+    (assoc effect-def ::explainer invocation-explainer)))
+
 (defn register-effect
   "Add an effect to `env`"
   [env name m]
   (when *check-definition-schemas*
     (when-let [explain (explain-effect-definition m)]
       (throw (ex-info "Invalid effect definition" explain))))
-  (let [invocation-schema (m/schema ::EffectInvocation {:registry full-malli-registry})
-        invocation-explainer (m/explainer
-                              (if-let [p (::params-schema m)]
-                                (mu/merge invocation-schema (m/schema p))
-                                invocation-schema))]
-    (register env ::effect name
-              (assoc m ::explainer invocation-explainer))))
+  (register env ::effect name (-> m (add-effect-invocation-explainer))))
 
 (defn register-effect!
   "Add an effect to `env*`"
@@ -245,7 +227,7 @@
 (defn- event->effect [x]
   (if (::event x)
     {::effect ::event
-     ::params (::event  x)}
+     ::params x}
     x))
 
 (defn- get-result-effect-invocations [x previous-effect-result]
@@ -282,7 +264,7 @@
   (let [effect-id (::effect effect-invocation)
         effect-def (get-effect env effect-id)
         _ (when *check-invocation-schemas*
-            (when-let [explain ((::explainer effect-def) effect-invocation)]
+            (when-let [explain (when-let [f (::explainer effect-def)] (f effect-invocation))]
               (throw (ex-info "Invalid effect invocation" explain))))
         impl      (::impl effect-def)
         params    (::params effect-invocation)]
@@ -333,19 +315,21 @@
 
 ;; -- Events --
 
+(defn- add-event-invocation-explainer [event-def]
+  (let [invocation-schema (m/schema ::EventInvocation {:registry full-malli-registry})
+        invocation-explainer (m/explainer
+                              (if-let [p (::params-schema event-def)]
+                                (mu/merge invocation-schema (m/schema p))
+                                invocation-schema))]
+    (assoc event-def ::explainer invocation-explainer)))
+
 (defn register-event
   "Add an event to `env`"
   [env name m]
   (when *check-definition-schemas*
     (when-let [explain (explain-event-definition m)]
       (throw (ex-info "Invalid event definition" explain))))
-  (let [invocation-schema (m/schema ::EventInvocation {:registry full-malli-registry})
-        invocation-explainer (m/explainer
-                              (if-let [p (::params-schema m)]
-                                (mu/merge invocation-schema (m/schema p))
-                                invocation-schema))]
-    (register env ::event name
-              (assoc m ::explainer invocation-explainer))))
+  (register env ::event name (-> m (add-event-invocation-explainer))))
 
 (defn register-event!
   "Add an event to `env*`"
@@ -369,7 +353,7 @@
      (let [event-id (::event event-invocation)
            event-def (get-event env event-id)
            _ (when *check-invocation-schemas*
-               (when-let [explain ((::explainer event-def) event-invocation)]
+               (when-let [explain (when-let [f (::explainer event-def)] (f event-invocation))]
                  (throw (ex-info "Invalid event invocation" explain))))
            impl      (::impl event-def)
            params    (::params event-invocation)]
@@ -382,6 +366,31 @@
                       (normalize-effect-invocations))
                fx-result (effects-seq! env fx)]
            fx-result))))))
+
+;; -- Envs
+
+(defn make-env
+  "Construct an environment."
+  []
+  {::effect {}
+   ::query  {}
+   ::event  {}})
+
+(defn make-default-env
+  "Construct an environment containing the default effects, queries, and events."
+  []
+  (-> (make-env)
+      (register-effect ::event
+                       {:params-schema (m/schema ::EventInvocation
+                                                 {:registry full-malli-registry})
+                        ::impl (fn [env event _] (handle-event! env event))})
+      (register-effect ::noop
+                       {::impl (constantly nil)})))
+
+(def default-env*
+  "An atom containing the default environment.
+  This is the atom mutated by default when registering effects, queries, and events."
+  (atom (make-default-env)))
 
 ;; -- Convenience Constructors
 
@@ -436,7 +445,14 @@
         ~(or (:com.knowclick.ometh/env* attr-map)
              'com.knowclick.ometh/default-env*)
         ~handler-name-kw
-        ~(assoc attr-map :com.knowclick.ometh/impl `(var ~handler-name))))))
+        ~(assoc attr-map :com.knowclick.ometh/impl
+                (case (count impl-params)
+                  2 `(fn [env# params# _query-results#]
+                       (~handler-name env# params#))
+                  3 `(var ~handler-name)
+                  (throw (ex-info (str "Invalid arglist for defquery impl function."
+                                       " Must provide 2 or 3 args.")
+                                  {:arglist impl-params}))))))))
 
 (comment
 
@@ -480,7 +496,14 @@
         ~(or (:com.knowclick.ometh/env* attr-map)
              'com.knowclick.ometh/default-env*)
         ~handler-name-kw
-        ~(assoc attr-map :com.knowclick.ometh/impl `(var ~handler-name))))))
+        ~(assoc attr-map :com.knowclick.ometh/impl
+                (case (count impl-params)
+                  2 `(fn [env# params# _query-results#]
+                       (~handler-name env# params#))
+                  3 `(var ~handler-name)
+                  (throw (ex-info (str "Invalid arglist for defeffect impl function."
+                                       " Must provide 2 or 3 args.")
+                                  {:arglist impl-params}))))))))
 
 (defmacro defevent
   "Define an event.
@@ -504,7 +527,14 @@
         ~(or (:com.knowclick.ometh/env* attr-map)
              'com.knowclick.ometh/default-env*)
         ~handler-name-kw
-        ~(assoc attr-map :com.knowclick.ometh/impl `(var ~handler-name))))))
+        ~(assoc attr-map :com.knowclick.ometh/impl
+                (case (count impl-params)
+                  2 `(fn [env# params# _query-results#]
+                       (~handler-name env# params#))
+                  3 `(var ~handler-name)
+                  (throw (ex-info (str "Invalid arglist for defevent impl function."
+                                       " Must provide 2 or 3 args.")
+                                  {:arglist impl-params}))))))))
 
 ;; -- Usage --
 
@@ -590,6 +620,14 @@
   (handle-event! {::event ::request-read-only-access
                   ::params {:user-id 1}})
 
+
+  (defevent foobar
+    [env params]
+    {::effect ::noop ::params params})
+
+  (handle-event! (->foobar [1 2 3]))
+
+  (foobar nil [4])
 
 
   )

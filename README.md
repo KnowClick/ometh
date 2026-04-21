@@ -4,6 +4,8 @@
 
 Ometh is a little library for doing controlled mutations. It is inspired by [re-frame](https://github.com/day8/re-frame) and [hifi-crud](https://github.com/Ramblurr/hifi-crud). The pattern this library encourages is commonly called [Functional Core, Imperative Shell](https://functional-architecture.org/functional_core_imperative_shell/).
 
+## Usage
+
 The core constructs of this library are:
 - queries: impure reads
 - effects: impure writes
@@ -58,7 +60,7 @@ This code gets the job done, but testing requires either creating the DB connect
 
 "Functional core, imperative shell" would encourage us to do our impure reads in an outer layer, then, in the inner layer, decide what effects are necessary, then, back in the outer layer, run those effects. That model is a bit too simplistic when we consider that code like this is often not strictly `read -> decide -> write`, but instead each of these any number of times in any order.
 
-## Clean Writes
+### Clean Writes
 
 We can get much of the benefit of pure functions by only rearranging the writes (we'll look at options for dealing with reads in a bit). Instead of doing the writes directly, we'll return data describing the writes. We'll then separately interpret that data to perform the actual mutations.
 
@@ -117,7 +119,7 @@ We can get much of the benefit of pure functions by only rearranging the writes 
 
 `request-booking` is now pure in terms of its writes. It returns "effect invocations", maps structured as Ometh expects and which describe effects to perform. `o/effects!` finds the effects by name in the `env*` and executes them, following `::o/on-success` and `::o/on-error` as appropriate.
 
-## Registered Events
+### Registered Events
 
 The above definition of `request-booking` requires callers to call `o/effects!`. Also, there's no data describing the event itself, which might be useful for logging. We can improve the situation by registering an event:
 
@@ -177,7 +179,7 @@ The above definition of `request-booking` requires callers to call `o/effects!`.
 
 We still have `request-booking` available for testing, but we use `::request-booking` to describe the event with data.
 
-## Convenience
+### Convenience
 
 So far we've been invoking and defining events and effects the verbose way. There are convenience functions for constructing invocations and macros for defining events, effects, and queries. The above could instead be defined as:
 
@@ -228,7 +230,7 @@ So far we've been invoking and defining events and effects the verbose way. Ther
 Note that in the above, the `env` is implicit; Ometh defines a `default-env*` that will probably be sufficient for most use cases. You can also pass `::o/env*` to these macros to use a different env atom.
 
 
-## Clean Reads
+### Clean Reads
 
 We've mostly ignored impure reads until now for the simple reason that impure writes are more problematic than impure reads. If you only clean up your impure writes you will have made a significant improvement to your code.
 
@@ -327,3 +329,9 @@ Another option is to return an event invocation anywhere we would otherwise have
 ```
 
 Our event is now defined in terms of 2 pure functions. With this model we can define flows consisting of "read", "decide", and "write", any number of times, in any order, using only pure "decide" functions.
+
+### Tips
+
+- Include retry logic when necessary in effect definitions, rather than trying to dispatch effects/events for retries.
+- Keep effects minimal and rely on `::o/on-success` for chaining effects which must happen in sequence.
+- Queries should return as little data as possible. This makes testing easier.

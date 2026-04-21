@@ -1,4 +1,5 @@
 (ns com.knowclick.ometh
+  "Controlled reads and writes."
   (:require
    [fmnoise.flow :as flow]
    [malli.core :as m]
@@ -12,7 +13,7 @@
                        [:ref ::QueryDependencies]]
                       [::impl
                        {:doc "Function which implements this query"}
-                       [:=> [:cat ::Env ::QueryResults ::Params] :any]]
+                       [:=> [:cat ::Env ::Params ::QueryResults] :any]]
                       [::params-schema
                        {:optional true
                         :doc "Malli schema for the parameters of this query"}
@@ -36,7 +37,7 @@
                         [:ref ::QueryDependencies]]
                        [::impl
                         {:doc "Function which performs the effect"}
-                        [:=> [:cat ::Env ::QueryResults ::Params] :any]]
+                        [:=> [:cat [:ref ::Env] [:ref ::Params] [:ref ::QueryResults]] :any]]
                        [::params-schema
                         {:optional true
                          :doc "Malli schema for the parameters of this effect"}
@@ -45,7 +46,7 @@
                        [::effect :keyword]
                        [::params {:optional true} [:ref ::Params]]
                        [::on-success {:optional true} [:ref ::EffectResultHandler]]
-                       [::on-failure {:optional true} [:ref ::EffectResultHandler]]]
+                       [::on-error {:optional true} [:ref ::EffectResultHandler]]]
    ::EffectResult :any
    ::EffectResultHandler [:orn
                           [:effect [:ref ::EffectInvocation]]
@@ -56,7 +57,7 @@
                                      [:effect [:ref ::EffectInvocation]]
                                      [:event  [:ref ::EventInvocation]]
                                      [:nil    nil?]]]]
-                          [:fn     [:=> [:cat ::EffectResult]
+                          [:fn     [:=> [:cat [:ref ::EffectResult]]
                                     [:orn
                                      [:effect [:ref ::EffectInvocation]]
                                      [:event  [:ref ::EventInvocation]]
@@ -73,15 +74,14 @@
                        [:ref ::QueryDependencies]]
                       [::impl
                        {:doc "Function which decides what to do when the event occurs"}
-                       [:=> [:cat ::Env ::QueryResults ::Params] :any]]
+                       [:=> [:cat [:ref ::Env] [:ref ::Params] [:ref ::QueryResults]] :any]]
                       [::params-schema
                        {:optional true
                         :doc "Malli schema for the parameters of this event"}
                        :any]]
    ::EventInvocation [:map
                       [::event :keyword]
-                      [::params {:optional true} [:ref ::Params]]]
-   })
+                      [::params {:optional true} [:ref ::Params]]]})
 
 (def full-malli-registry (merge (m/default-schemas) malli-registry))
 
@@ -124,11 +124,12 @@
    ::query  (or queries  {})
    ::event  (or events {})})
 
-(declare handle-event!)
+(declare handle-event! effect!)
 
 (def default-effects
   {::event {;; ::params-schema EventInvocation ;; todo
-            ::impl (fn [env _ event] (handle-event! env event))}})
+            ::impl (fn [env event _] (handle-event! env event))}
+   ::noop  {::impl (constantly nil)}})
 
 (defn make-default-env
   "Construct an environment containing the default effects, queries, and events."
@@ -198,7 +199,7 @@
                        {:invocation query-invocation})))
      (binding [*pending-invocations* (conj *pending-invocations* query-invocation)]
        (let [query-results (execute-dependency-queries env params (::queries query-def))]
-         (impl env query-results params))))))
+         (impl env params query-results))))))
 
 (defn q
   "Execute any number of queries, returning a map from alias to query result.
@@ -262,11 +263,21 @@
     (sequential? x) (->> x (remove nil?) (mapv event->effect))
     :else (throw (ex-info "Unrecognized effects" {:effects x}))))
 
+(defn normalize-effect-invocations
+  "Events can return their effects in various forms - this normalizes those forms to a vector of event invocations."
+  [x]
+  (cond
+    (nil? x) x
+    (::effect x) [x]
+    (::event  x) [(event->effect x)]
+    (sequential? x) (->> x (remove nil?) (mapv event->effect))
+    :else (throw (ex-info "Unrecognized effects" {:effects x}))))
+
 (declare effects-seq!)
 
 (defn effect-step!
   "Execute an effect invocation, returning its result.
-  Does not execute on-success or on-failure."
+  Does not execute on-success or on-error."
   [env effect-invocation]
   (let [effect-id (::effect effect-invocation)
         effect-def (get-effect env effect-id)
@@ -280,28 +291,29 @@
                       {:invocation effect-invocation})))
     (binding [*pending-invocations* (conj *pending-invocations* effect-invocation)]
       (let [query-results (execute-dependency-queries env params (::queries effect-def))
-            result (try (impl env query-results params)
+            result (try (impl env params query-results)
                         (catch Throwable t t))]
         result))))
 
 (defn effect!
-  "Execute an effect invocation, and any provided on-success or on-failure as appropriate.
+  "Execute an effect invocation, and any provided on-success or on-error as appropriate.
   Returns effect invocation with associated ::result and
-  ::on-success-result or ::on-failure-result as appropriate."
+  ::on-success-result or ::on-error-result as appropriate."
   [env effect-invocation]
   (let [result (effect-step! env effect-invocation)
         more (if (flow/fail? result)
-               (if-let [fx (get-result-effect-invocations (::on-failure effect-invocation)
+               (if-let [fx (get-result-effect-invocations (::on-error effect-invocation)
                                                           result)]
-                 {::on-failure-result (effects-seq! env fx)}
-                 (throw (ex-info "Effect failed with no on-failure provided"
+                 {::on-error-result (effects-seq! env fx)}
+                 (throw (ex-info "Effect failed with no on-error provided"
                                  {:failure result})))
                (if-let [fx (get-result-effect-invocations (::on-success effect-invocation)
                                                           result)]
                  {::on-success-result (effects-seq! env fx)}
                  nil))]
-    (merge effect-invocation
-           (assoc more ::result result))))
+    (-> effect-invocation
+        (merge more)
+        (assoc ::result result))))
 
 (defn- effects-seq! [env effect-invocations]
   (mapv
@@ -310,17 +322,14 @@
    effect-invocations))
 
 (defn effects!
-  "Execute any number of effect invocations, returning a map from alias to effect result."
-  ([name->effect-invocation]
+  "Normalizes `effects` to a sequence of effect invocations and executes them."
+  ([effects]
    (when-not *env*
-     (throw (ex-info "Cannot execute effects without env" {:effects name->effect-invocation})))
-   (effects! *env* name->effect-invocation))
-  ([env name->effect-invocation]
-   (reduce-kv
-    (fn [memo effect-key effect-invocation]
-      (assoc memo effect-key (effect! env effect-invocation)))
-    {}
-    name->effect-invocation)))
+     (throw (ex-info "Cannot execute effects without env" {:effects effects})))
+   (effects! *env* effects))
+  ([env effects]
+   (let [effects (normalize-effect-invocations effects)]
+     (effects-seq! env effects))))
 
 ;; -- Events --
 
@@ -347,14 +356,6 @@
 (defn get-event [env event-id]
   (lookup env ::event event-id))
 
-(defn- get-event-result-effect-invocations [x]
-  (cond
-    (nil? x) x
-    (::effect x) [x]
-    (::event  x) [(event->effect x)]
-    (sequential? x) (->> x (remove nil?) (mapv event->effect))
-    :else (throw (ex-info "Unrecognized effects" {:effects x}))))
-
 (defn handle-event!
   "Handle an event invocation by:
   - executing its ::queries
@@ -377,8 +378,8 @@
                          {:invocation event-invocation})))
        (binding [*pending-invocations* (conj *pending-invocations* event-invocation)]
          (let [query-results (execute-dependency-queries env params (::queries event-def))
-               fx (-> (impl query-results params)
-                      (get-event-result-effect-invocations))
+               fx (-> (impl env params query-results)
+                      (normalize-effect-invocations))
                fx-result (effects-seq! env fx)]
            fx-result))))))
 
@@ -393,11 +394,11 @@
   "Construct an effect invocation"
   ([name] {::effect name})
   ([name params] {::effect name ::params params})
-  ([name params & {:keys [on-success on-failure]}]
+  ([name params & {:keys [on-success on-error]}]
    (cond-> {::effect name}
      params (assoc ::params params)
      on-success (assoc ::on-success on-success)
-     on-failure (assoc ::on-failure on-failure))))
+     on-error (assoc ::on-error on-error))))
 
 (defn ->event
   "Construct an event invocation"
@@ -416,30 +417,28 @@
 (defmacro defquery
   "Define a query.
   Registers the query in the default or given ::env* atom.
-  Defines a function of the query's name to construct invocations of it."
+  Defines a function ->{query-name} to construct invocations of it.
+  Defines a function {query-name} that implements the query (the ::impl function)."
   [query-name & args]
-  (let [parse-result (m/parse defhandler-args-schema args)
+  (let [handler-name query-name
+        parse-result (m/parse defhandler-args-schema args)
         _ (when (= ::m/invalid parse-result)
             (throw (ex-info "Invalid defquery args" (m/explain defhandler-args-schema args))))
         {:keys [docstring attr-map impl-params body]} (:values parse-result)
-        query-name-kw (keyword (name (ns-name *ns*)) (name query-name))]
+        handler-name-kw (keyword (name (ns-name *ns*)) (name handler-name))]
     `(do
-       (defn ~query-name ~@(when docstring [docstring])
-         ([] (com.knowclick.ometh/->query ~query-name-kw))
-         ([params#] (com.knowclick.ometh/->query ~query-name-kw params#)))
+       (defn ~(-> (str "->" handler-name) symbol)
+         ~@(when docstring [docstring])
+         ([] (com.knowclick.ometh/->query ~handler-name-kw))
+         ([params#] (com.knowclick.ometh/->query ~handler-name-kw params#)))
+       (defn ~handler-name ~@(when docstring [docstring]) ~impl-params ~@body)
        (com.knowclick.ometh/register-query!
         ~(or (:com.knowclick.ometh/env* attr-map)
              'com.knowclick.ometh/default-env*)
-        ~query-name-kw
-        ~(assoc attr-map :com.knowclick.ometh/impl `(fn ~impl-params ~@body))))))
+        ~handler-name-kw
+        ~(assoc attr-map :com.knowclick.ometh/impl `(var ~handler-name))))))
 
 (comment
-  ;; defquery is roughly equiv to this `do`:
-  (do (register-query!
-       default-env*
-       ::foo
-       {::impl (fn [env query-results params])})
-      (def foo (fn ([] (->query ::foo)) ([params] (->query ::foo params)))))
 
   (macroexpand-1 '(defquery foo
                     "Does something cool."
@@ -461,43 +460,51 @@
 (defmacro defeffect
   "Define an effect.
   Registers the effect in the default or given ::env* atom.
-  Defines a function of the effect's name to construct invocations of it."
-  [handler-name & args]
-  (let [parse-result (m/parse defhandler-args-schema args)
+  Defines a function ->{effect-name} to construct invocations of it.
+  Defines a function {effect-name} that implements the effect (the ::impl function)."
+  [effect-name & args]
+  (let [handler-name effect-name
+        parse-result (m/parse defhandler-args-schema args)
         _ (when (= ::m/invalid parse-result)
             (throw (ex-info "Invalid defeffect args" (m/explain defhandler-args-schema args))))
         {:keys [docstring attr-map impl-params body]} (:values parse-result)
         handler-name-kw (keyword (name (ns-name *ns*)) (name handler-name))]
     `(do
-       (defn ~handler-name ~@(when docstring [docstring])
+       (defn ~(-> (str "->" handler-name) symbol)
+         ~@(when docstring [docstring])
          ([] (com.knowclick.ometh/->effect ~handler-name-kw))
          ([params#] (com.knowclick.ometh/->effect ~handler-name-kw params#))
          ([params# & more#] (apply com.knowclick.ometh/->effect ~handler-name-kw params# more#)))
+       (defn ~handler-name ~@(when docstring [docstring]) ~impl-params ~@body)
        (com.knowclick.ometh/register-effect!
         ~(or (:com.knowclick.ometh/env* attr-map)
              'com.knowclick.ometh/default-env*)
         ~handler-name-kw
-        ~(assoc attr-map :com.knowclick.ometh/impl `(fn ~impl-params ~@body))))))
+        ~(assoc attr-map :com.knowclick.ometh/impl `(var ~handler-name))))))
 
 (defmacro defevent
   "Define an event.
   Registers the event in the default or given ::env* atom.
-  Defines a function of the event's name to construct invocations of it."
-  [handler-name & args]
-  (let [parse-result (m/parse defhandler-args-schema args)
+  Defines a function ->{event-name} to construct invocations of it.
+  Defines a function {event-name} that implements the event (the ::impl function)."
+  [event-name & args]
+  (let [handler-name event-name
+        parse-result (m/parse defhandler-args-schema args)
         _ (when (= ::m/invalid parse-result)
             (throw (ex-info "Invalid defevent args" (m/explain defhandler-args-schema args))))
         {:keys [docstring attr-map impl-params body]} (:values parse-result)
         handler-name-kw (keyword (name (ns-name *ns*)) (name handler-name))]
     `(do
-       (defn ~handler-name ~@(when docstring [docstring])
+       (defn ~(-> (str "->" handler-name) symbol)
+         ~@(when docstring [docstring])
          ([] (com.knowclick.ometh/->event ~handler-name-kw))
          ([params#] (com.knowclick.ometh/->event ~handler-name-kw params#)))
+       (defn ~handler-name ~@(when docstring [docstring]) ~impl-params ~@body)
        (com.knowclick.ometh/register-event!
         ~(or (:com.knowclick.ometh/env* attr-map)
              'com.knowclick.ometh/default-env*)
         ~handler-name-kw
-        ~(assoc attr-map :com.knowclick.ometh/impl `(fn ~impl-params ~@body))))))
+        ~(assoc attr-map :com.knowclick.ometh/impl `(var ~handler-name))))))
 
 ;; -- Usage --
 
@@ -507,7 +514,7 @@
 
   (register-query!
    ::access-mode
-   {::impl (fn [env _ {:keys [user-id]}] (get-in @db* [user-id :access-mode] :read-only))})
+   {::impl (fn [env {:keys [user-id]} _] (get-in @db* [user-id :access-mode] :read-only))})
 
   (q1 @default-env* {::query ::access-mode
                      ::params {:user-id 1}})
@@ -516,7 +523,7 @@
 
   (register-effect!
    ::set-access-mode
-   {::impl (fn [env _ {:keys [user-id mode]}]
+   {::impl (fn [env {:keys [user-id mode]} _]
              (swap! db* assoc-in [user-id :access-mode] mode))})
 
   (effect! @default-env* {::effect ::set-access-mode
@@ -527,13 +534,11 @@
                      ::params {:user-id 1}})
 
 
-  (effects! @default-env* {:set-access-mode {::effect ::set-access-mode
-                                             ::params {:user-id 1
-                                                       :mode :whatever}}})
+
 
   (register-effect!
    ::inc-success-count
-   {::impl (fn [env _ {:keys [user-id]}]
+   {::impl (fn [env {:keys [user-id]} _]
              (swap! db* update-in [user-id :success-count] (fnil inc 0)))})
 
   (effect! @default-env* {::effect ::set-access-mode
@@ -552,7 +557,7 @@
 
   (register-effect!
    ::println
-   {::impl (fn [env _ msg]
+   {::impl (fn [env msg _]
              (println msg))})
 
   (register-event!
@@ -560,7 +565,7 @@
    {::queries {:current (fn [{:keys [user-id]}]
                           {::query ::access-mode
                            ::params {:user-id user-id}})}
-    ::impl (fn [{:keys [current]} {:keys [user-id]}]
+    ::impl (fn [_ {:keys [user-id]} {:keys [current]}]
              (if (= current :write)
                {::effect ::println
                 ::params "You can already write."}
@@ -572,7 +577,7 @@
 
   (register-event!
    ::request-read-only-access
-   {::impl (fn [_ {:keys [user-id]}]
+   {::impl (fn [env {:keys [user-id]} _]
              {::effect ::set-access-mode
               ::params {:user-id user-id
                         :mode :read-only}
@@ -584,7 +589,6 @@
 
   (handle-event! {::event ::request-read-only-access
                   ::params {:user-id 1}})
-
 
 
 

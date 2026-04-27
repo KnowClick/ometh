@@ -447,8 +447,10 @@
         ~handler-name-kw
         ~(assoc attr-map :com.knowclick.ometh/impl
                 (case (count impl-params)
-                  2 `(fn [env# params# _query-results#]
-                       (~handler-name env# params#))
+                  1 `(fn [_env# params# _query-results#]
+                       (~handler-name params#))
+                  2 `(fn [_env# params# query-results#]
+                       (~handler-name params# query-results#))
                   3 `(var ~handler-name)
                   (throw (ex-info (str "Invalid arglist for defquery impl function."
                                        " Must provide 2 or 3 args.")

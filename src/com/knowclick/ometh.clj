@@ -107,6 +107,13 @@
                  ::category :not-found})))
     item))
 
+(defn- lookup-from-invocation [env invocation]
+  (cond
+    (::query invocation) (lookup env ::query (::query invocation))
+    (::event invocation) (lookup env ::event (::event invocation))
+    (::effect invocation) (lookup env ::effect (::effect invocation))
+    :else (throw (ex-info "Unrecognized invocation" {:invocation invocation}))))
+
 (def ^:private ^:dynamic *env* nil)
 
 (def ^:dynamic *check-definition-schemas*
@@ -150,16 +157,86 @@
 
 (declare q)
 
-(defn- execute-dependency-queries
-  "Execute the queries that are dependencies of an effect, query, or event."
-  [env invocation-params queries]
-  (->> queries
-       (into {}
-             (map (fn [[k query-invocation-or-fn]]
-                    [k (if (fn? query-invocation-or-fn)
-                         (query-invocation-or-fn invocation-params)
-                         query-invocation-or-fn)])))
-       (q env)))
+(defn- query-groups
+  "Given a seq of query invocations (NOT functions returning query invocations)
+  return a list where item 0 is the set of all queries which depend on no other queries,
+  item 1 is the set of all queries which depend on queries in item 0 or nothing,
+  item n is the set of all queries which depend on queries in item n-1 or nothing.
+
+  Gathers all transitive dependency queries of `invocations`"
+  [env invocations]
+  (loop [out (list (set invocations))
+         invocations invocations]
+    (let [next-group (->> invocations
+                          (mapcat (fn [invocation]
+                                    (let [item (lookup-from-invocation env invocation)
+                                          queries (::queries item)
+                                          params  (::params invocation)]
+                                      (->> queries
+                                           vals
+                                           (map (fn [query-invocation-or-fn]
+                                                  (if (fn? query-invocation-or-fn)
+                                                    (query-invocation-or-fn params)
+                                                    query-invocation-or-fn)))))))
+                          (set))]
+      (if (seq next-group)
+        (if (some #(= % next-group) out)
+          (throw (ex-info "Infinite query loop detected" {:groups out :repeat next-group}))
+          (recur (conj out next-group)
+                 next-group))
+        out))))
+
+(defn- execute-query-invocation
+  "Execute a query invocation, given the results of all its dependencies as a mapping from query invocation to result."
+  [env query-invocation dependency-results]
+  (let [query-id (::query query-invocation)
+        query-def (get-query env query-id)
+        _ (when *check-invocation-schemas*
+            (when-let [explain (when-let [f (::explainer query-def)] (f query-invocation))]
+              (throw (ex-info "Invalid query invocation"
+                              (assoc explain
+                                     ::kind :invalid-query-invocation
+                                     ::category :incorrect)))))
+        impl      (::impl query-def)
+        params    (::params query-invocation)]
+    (when (contains? *pending-invocations* query-invocation)
+      (throw (ex-info "Recursive query invocation detected"
+                      {:invocation query-invocation
+                       ::category :fault})))
+    (binding [*pending-invocations* (conj *pending-invocations* query-invocation)]
+      (let [;; TODO: we redundantly convert fn-form query invocations to data-form query
+            ;; invocations.
+            query-results (reduce-kv
+                           (fn [m k query-invocation]
+                             (let [query-invocation (if (fn? query-invocation)
+                                                      (query-invocation params)
+                                                      query-invocation)]
+                               (assoc m k (get dependency-results query-invocation))))
+                           {}
+                           (::queries query-def))]
+        (impl env params query-results)))))
+
+(defn- execute-query-groups
+  "Given query invocation groups where each query invocation in each group depends only on queries in earlier groups, returns a mapping from query invocation to result."
+  [env groups]
+  (reduce
+   (fn [prev-group-results group]
+     ;; TODO: could execute all queries in the group in parallel.
+     (into prev-group-results
+           (comp
+            (remove (fn [query-invocation] (contains? prev-group-results query-invocation)))
+            (map (fn [query-invocation]
+                   [query-invocation
+                    (execute-query-invocation
+                     env query-invocation prev-group-results)])))
+           group))
+   {}
+   groups))
+
+(defn- execute-queries [env invocations]
+  (let [groups (query-groups env invocations)
+        invocation->result (execute-query-groups env groups)]
+    invocation->result))
 
 (defn q1
   "Execute 1 query, returning its result.
@@ -169,23 +246,8 @@
      (throw (ex-info "Cannot execute query without env" {:query query-invocation})))
    (q1 *env* query-invocation))
   ([env query-invocation]
-   (let [query-id (::query query-invocation)
-         query-def (get-query env query-id)
-         _ (when *check-invocation-schemas*
-             (when-let [explain (when-let [f (::explainer query-def)] (f query-invocation))]
-               (throw (ex-info "Invalid query invocation"
-                               (assoc explain
-                                      ::kind :invalid-query-invocation
-                                      ::category :incorrect)))))
-         impl      (::impl query-def)
-         params    (::params query-invocation)]
-     (when (contains? *pending-invocations* query-invocation)
-       (throw (ex-info "Recursive query invocation detected"
-                       {:invocation query-invocation
-                        ::category :fault})))
-     (binding [*pending-invocations* (conj *pending-invocations* query-invocation)]
-       (let [query-results (execute-dependency-queries env params (::queries query-def))]
-         (impl env params query-results))))))
+   (let [results (execute-queries env [query-invocation])]
+     (get results query-invocation))))
 
 (defn q
   "Execute any number of queries, returning a map from alias to query result.
@@ -196,12 +258,22 @@
      (throw (ex-info "Cannot execute queries without env" {:queries queries})))
    (q *env* queries))
   ([env queries]
-   ;; TODO: could parallelize this:
-   (reduce-kv
-    (fn [memo query-key query-invocation]
-      (assoc memo query-key (q1 env query-invocation)))
-    {}
-    queries)))
+   (let [invocations (vals queries)
+         results (execute-queries env invocations)]
+     (into {}
+           (map (fn [[k invocation]] [k (get results invocation)]))
+           queries))))
+
+(defn- execute-dependency-queries
+    "Execute the queries that are dependencies of an effect or event."
+    [env invocation-params queries]
+    (->> queries
+         (into {}
+               (map (fn [[k query-invocation-or-fn]]
+                      [k (if (fn? query-invocation-or-fn)
+                           (query-invocation-or-fn invocation-params)
+                           query-invocation-or-fn)])))
+         (q env)))
 
 ;; -- Effects --
 

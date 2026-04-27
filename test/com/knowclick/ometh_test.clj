@@ -69,8 +69,12 @@
                 (o/register-query ::doubled
                                   {::o/queries {:base (fn [{:keys [n]}]
                                                         {::o/query ::base ::o/params {:n n}})}
-                                   ::o/impl (fn [_ _ {:keys [base]}] (* 2 base))}))]
+                                   ::o/impl (fn [_ _ {:keys [base]}]
+                                              (* 2 base))}))]
     (is (= 10 (o/q1 env {::o/query ::doubled ::o/params {:n 5}})))))
+
+(comment
+  (query-with-declared-dependencies-test))
 
 (deftest q1-inside-event-impl-uses-bound-env-test
   (testing "q1 with no env arg works inside an event impl where *env* is bound"
@@ -84,6 +88,29 @@
                                                   {::o/effect ::noop-log ::o/params v}))}))]
       (o/handle-event! (assoc env :val :found-it) {::o/event ::use-q1})
       (is (= :found-it @log)))))
+
+(deftest query-dedupe
+  (testing "Queries are deduplicated."
+    (let [log (atom {})
+          env (-> (fresh-env)
+                  (o/register-query ::base {::o/impl (fn [_ {:keys [n]} _]
+                                                       (swap! log update n (fnil inc 0))
+                                                       n)})
+                  (o/register-query ::doubled
+                                    {::o/queries {:base (fn [{:keys [n]}]
+                                                          {::o/query ::base ::o/params {:n n}})}
+                                     ::o/impl (fn [_ _ {:keys [base]}]
+                                                (* 2 base))}))]
+      (is (= (o/q env {:first {::o/query ::doubled
+                               ::o/params {:n 1}}
+                       :second {::o/query ::doubled
+                                ::o/params {:n 1}}
+                       :third {::o/query ::doubled
+                               ::o/params {:n 2}}})
+             {:first 2
+              :second 2
+              :third 4}))
+      (is (= @log {1 1 2 1})))))
 
 ;; ---------------------------------------------------------------------------
 ;; Effects

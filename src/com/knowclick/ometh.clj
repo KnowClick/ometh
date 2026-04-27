@@ -102,7 +102,9 @@
     (when-not item
       (throw
        (ex-info (str "Unrecognized " (clojure.core/name kind))
-                {:name name})))
+                {:name name
+                 :kind kind
+                 ::category :not-found})))
     item))
 
 (def ^:private ^:dynamic *env* nil)
@@ -125,7 +127,7 @@
   (let [invocation-schema (m/schema ::QueryInvocation {:registry full-malli-registry})
         invocation-explainer (m/explainer
                               (if-let [p (::params-schema query-def)]
-                                (mu/merge invocation-schema (m/schema p))
+                                (mu/merge invocation-schema [:map [::params (m/schema p)]])
                                 invocation-schema))]
     (assoc query-def ::explainer invocation-explainer)))
 
@@ -171,12 +173,16 @@
          query-def (get-query env query-id)
          _ (when *check-invocation-schemas*
              (when-let [explain (when-let [f (::explainer query-def)] (f query-invocation))]
-               (throw (ex-info "Invalid query invocation" explain))))
+               (throw (ex-info "Invalid query invocation"
+                               (assoc explain
+                                      ::kind :invalid-query-invocation
+                                      ::category :incorrect)))))
          impl      (::impl query-def)
          params    (::params query-invocation)]
      (when (contains? *pending-invocations* query-invocation)
        (throw (ex-info "Recursive query invocation detected"
-                       {:invocation query-invocation})))
+                       {:invocation query-invocation
+                        ::category :fault})))
      (binding [*pending-invocations* (conj *pending-invocations* query-invocation)]
        (let [query-results (execute-dependency-queries env params (::queries query-def))]
          (impl env params query-results))))))
@@ -203,7 +209,7 @@
   (let [invocation-schema (m/schema ::EffectInvocation {:registry full-malli-registry})
         invocation-explainer (m/explainer
                               (if-let [p (::params-schema effect-def)]
-                                (mu/merge invocation-schema (m/schema p))
+                                (mu/merge invocation-schema [:map [::params (m/schema p)]])
                                 invocation-schema))]
     (assoc effect-def ::explainer invocation-explainer)))
 
@@ -319,7 +325,7 @@
   (let [invocation-schema (m/schema ::EventInvocation {:registry full-malli-registry})
         invocation-explainer (m/explainer
                               (if-let [p (::params-schema event-def)]
-                                (mu/merge invocation-schema (m/schema p))
+                                (mu/merge invocation-schema [:map [::params (m/schema p)]])
                                 invocation-schema))]
     (assoc event-def ::explainer invocation-explainer)))
 
@@ -354,7 +360,10 @@
            event-def (get-event env event-id)
            _ (when *check-invocation-schemas*
                (when-let [explain (when-let [f (::explainer event-def)] (f event-invocation))]
-                 (throw (ex-info "Invalid event invocation" explain))))
+                 (throw (ex-info "Invalid event invocation"
+                                 (assoc explain
+                                        ::kind :invalid-event-invocation
+                                        ::category :incorrect)))))
            impl      (::impl event-def)
            params    (::params event-invocation)]
        (when (contains? *pending-invocations* event-invocation)

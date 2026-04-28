@@ -1,5 +1,6 @@
 {:deps {fmnoise/flow {:mvn/version "4.3.0"}
-        metosin/malli {:mvn/version "0.20.1"}}
+        metosin/malli {:mvn/version "0.20.1"}
+        exoscale/interceptor {:mvn/version "0.1.17"}}
  :paths ["src" "resources"]
  :aliases
  {:dev {:extra-deps {org.clojure/clojure {:mvn/version "1.12.0"}}

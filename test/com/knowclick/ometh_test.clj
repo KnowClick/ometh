@@ -1,7 +1,8 @@
 (ns com.knowclick.ometh-test
   (:require
    [com.knowclick.ometh :as o]
-   [clojure.test :as t :refer [is deftest testing]]))
+   [clojure.test :as t :refer [is deftest testing]]
+   [exoscale.interceptor :as ei]))
 
 (defn- fresh-env [] (o/make-default-env))
 
@@ -289,13 +290,34 @@
   (is (thrown-with-msg? Exception #"Unrecognized"
                         (o/handle-event! (fresh-env) {::o/event ::does-not-exist}))))
 
+;; -- Interceptors --
+
+(deftest handle-event!-with-interceptors
+  (let [log (atom [])
+        env (-> (fresh-env)
+                (o/register-effect ::log {::o/impl (fn [_ {:keys [msg]} _] (swap! log conj msg))})
+                (o/register-interceptor
+                 ::check-auth
+                 {:enter {::o/impl (fn [ctx]
+                                     (-> ctx
+                                         (assoc ::o/effects {::o/effect ::log
+                                                             ::o/params {:msg "no auth"}})
+                                         (ei/terminate)))}})
+                (o/register-event ::do-if-authorized
+                                  {::o/interceptors [{::o/interceptor ::check-auth}]
+                                   ::o/impl (fn [_ _ _]
+                                              {::o/effect ::log
+                                               ::o/params {:msg "yes auth"}})}))]
+    (o/handle-event! env {::o/event ::do-if-authorized})
+    (is (= ["no auth"] @log))))
+
 ;; ---------------------------------------------------------------------------
 ;; normalize-effect-invocations
 ;; ---------------------------------------------------------------------------
 
 (deftest normalize-effect-invocations-test
   (testing "nil stays nil"
-    (is (nil? (o/normalize-effect-invocations nil))))
+    (is (= [] (o/normalize-effect-invocations nil))))
 
   (testing "single effect wrapped in vector"
     (is (= [{::o/effect ::foo}]

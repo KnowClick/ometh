@@ -173,7 +173,7 @@ The above definition of `request-booking` requires callers to call `o/effects!`.
 (o/register-event! env* ::request-booking {::o/impl #'request-booking})
 
 (o/handle-event! @env* {::o/event ::request-booking
-                       ::o/params {:user-id user-id :appointment-window 'whatever}})
+                        ::o/params {:user-id user-id :appointment-window 'whatever}})
 
 ```
 
@@ -329,6 +329,99 @@ Another option is to return an event invocation anywhere we would otherwise have
 ```
 
 Our event is now defined in terms of 2 pure functions. With this model we can define flows consisting of "read", "decide", and "write", any number of times, in any order, using only pure "decide" functions.
+
+We could also use interceptors to manage flows like this.
+
+### Interceptors
+
+Interceptors are maps containing keys (all optional) `:enter`, `:leave`, and `:error`. An interceptor executor applies a sequence of a interceptors to `ctx` map, eventually returning a probably-updated `ctx` map. Ometh uses [`exoscale/interceptor`](https://github.com/exoscale/interceptor) as its interceptor executor.
+
+Interceptors in Ometh wrap event `::o/impl` functions. The `ctx` of the interceptor chain contains:
+
+- `::o/env`: the Ometh env
+- `::o/event-invocation`: the invocation for the event currently being handled
+- `::o/params`: the current interceptor's parameters
+- `::o/query-results`: the current interceptor's query results
+- `:exoscale.interceptor/error` (only in :error): the error
+- `::o/effects`: added somewhere in the interceptor chain; the effects to do.
+
+The purpose of executing the interceptor chain is to produce that `::o/effects` value; everything else in the result `ctx` is ignored.
+
+The event's `::o/impl` function is itself converted to an interceptor and is the last one in the chain. Ometh interceptors are basically just event handlers with signature `[ctx]=>ctx` rather than `[env, params, query-results]=>?effects`.
+
+Interceptors are registered:
+
+```clojure
+(o/register-interceptor!
+ ::check-auth
+ {:enter {::o/impl (fn [ctx]
+                     (if (authorized? ctx)
+                       ctx
+                       (-> ctx
+                           (assoc ::o/effects {::o/effect ::scold-user
+                                               ::o/params {:msg "You can't do that"}})
+                           ;; Don't process rest of interceptor chain, instead turn around
+                           ;; and start running :leave handlers:
+                           (exoscale.interceptor/terminate))))}})
+```
+
+But we're sneaking back to the land of impure reads if we just call `(authorized? ctx)`, so interceptors can use queries like other Ometh constructs:
+
+``` clojure
+(o/register-interceptor!
+ ::check-auth
+ {:enter {::o/queries {:authz {::o/query ::authorized}}
+          ::o/impl (fn [{::o/keys [query-results] :as ctx}]
+                     (if (:authz query-results)
+                       ctx
+                       (-> ctx
+                           (assoc ::o/effects {::o/effect ::scold-user
+                                               ::o/params {:msg "You can't do that"}})
+                           (exoscale.interceptor/terminate))))}})
+```
+
+Note that each phase (`:enter`, `:leave`, `:error`) defines its own queries.
+
+There's also a convenience macro for interceptors, but it doesn't save too many keystrokes:
+
+```clojure
+(o/definterceptor check-auth
+  {:enter {::o/queries {:authz {::o/query ::authorized}}
+           ::o/impl (fn [{::o/keys [query-results] :as ctx}]
+                      (if (:authz query-results)
+                        ctx
+                        (-> ctx
+                            (assoc ::o/effects {::o/effect ::scold-user
+                                                ::o/params {:msg "You can't do that"}})
+                            (exoscale.interceptor/terminate))))}})
+```
+
+It does, however, produce the convenience `->{interceptor-name}` constructor function. It also defines a var `{interceptor-name}` holding the definition map and registers the interceptor.
+
+
+Use interceptors with events by including interceptors under `::o/interceptors`:
+
+```clojure
+(o/defevent launch-rockets
+  {::o/interceptors [(->check-auth)]}
+  [env params query-results]
+  ;; if we got here, we know we're authorized to launch rockets.
+  )
+```
+
+Finally, Ometh provides `terminate` for the common interceptor use case of terminating a chain with some effects. You'll need to use `exoscale.interceptor` directly for more advanced use cases.
+
+```clojure
+(o/definterceptor check-auth
+  {:enter {::o/queries {:authz {::o/query ::authorized}}
+           ::o/impl (fn [{::o/keys [query-results] :as ctx}]
+                      (if (:authz query-results)
+                        ctx
+                        (o/terminate ctx {::o/effect ::scold-user
+                                          ::o/params {:msg "You can't do that"}})))}})
+```
+
+
 
 ### Tips
 

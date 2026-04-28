@@ -294,17 +294,14 @@
 
 (deftest handle-event!-with-interceptors
   (let [log (atom [])
+        check-auth (-> {:enter (fn [ctx]
+                                 (o/terminate ctx {::o/effect ::log
+                                                   ::o/params {:msg "no auth"}}))}
+                       (o/lift-interceptor))
         env (-> (fresh-env)
                 (o/register-effect ::log {::o/impl (fn [_ {:keys [msg]} _] (swap! log conj msg))})
-                (o/register-interceptor
-                 ::check-auth
-                 {:enter {::o/impl (fn [ctx]
-                                     (-> ctx
-                                         (assoc ::o/effects {::o/effect ::log
-                                                             ::o/params {:msg "no auth"}})
-                                         (ei/terminate)))}})
                 (o/register-event ::do-if-authorized
-                                  {::o/interceptors [{::o/interceptor ::check-auth}]
+                                  {::o/interceptors [check-auth]
                                    ::o/impl (fn [_ _ _]
                                               {::o/effect ::log
                                                ::o/params {:msg "yes auth"}})}))]

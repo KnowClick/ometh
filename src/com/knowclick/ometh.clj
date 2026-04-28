@@ -26,8 +26,7 @@
    ::Env [:map
           [::effect [:map-of :keyword [:ref ::EffectDefinition]]]
           [::event  [:map-of :keyword [:ref ::EventDefinition]]]
-          [::query  [:map-of :keyword [:ref ::QueryDefinition]]]
-          [::interceptor [:map-of :keyword [:ref ::InterceptorDefinition]]]]
+          [::query  [:map-of :keyword [:ref ::QueryDefinition]]]]
    ::QueryResults [:map-of :any :any]
    ::Params :any
    ::QueryInvocation [:map
@@ -88,13 +87,17 @@
                        {:optional true}
                        [:vector
                         [:orn
-                         [:direct-invocation [:ref ::InterceptorInvocation]]
-                         [:fn [:=> [:cat ::Params] ::InterceptorInvocation]]]]]]
+                         [:map [:ref ::InterceptorDefinition]]
+                         [:fn  [:=> [:cat ::Params]
+                                [:or
+                                 :nil
+                                 [:ref ::InterceptorDefinition]
+                                 [:sequential [:ref ::InterceptorDefinition]]]]]]]]]
    ::EventInvocation [:map
                       [::event :keyword]
                       [::params {:optional true} [:ref ::Params]]]
    ::InterceptorContext
-   [:map
+   [:map {:doc "Keys included in the `ctx` passed to interceptors"}
     [::env [:ref ::Env]]
     [::event-invocation [:ref ::EventInvocation]]
     [::params {:optional true} [:ref ::Params]]
@@ -105,11 +108,7 @@
                            [:ref ::InterceptorContext]]
    ::InterceptorDefinition
    [:map
-    [::params-schema
-     {:optional true
-      :doc "Malli schema for the parameters of this interceptor"}
-     :any]
-    [:enter {:optional true}
+    [::enter {:optional true}
      [:map
       [::queries
        {:optional true
@@ -118,7 +117,7 @@
       [::impl
        {:doc "Function which implements the :enter phase of this interceptor"}
        [:ref ::InterceptorPhaseImpl]]]]
-    [:leave {:optional true}
+    [::leave {:optional true}
      [:map
       [::queries
        {:optional true
@@ -127,7 +126,7 @@
       [::impl
        {:doc "Function which implements the :leave phase of this interceptor"}
        [:ref ::InterceptorPhaseImpl]]]]
-    [:error {:optional true}
+    [::error {:optional true}
      [:map
       [::queries
        {:optional true
@@ -137,10 +136,7 @@
        {:doc "Function which implements the :error phase of this interceptor"}
        [:=> [:cat [:ref ::InterceptorContext] :any] ;; second arg is the error.
         [:ref ::InterceptorContext]]]]]]
-   ::InterceptorInvocation
-   [:map
-    [::interceptor :keyword]
-    [::params {:optional true} [:ref ::Params]]]})
+   })
 
 (def full-malli-registry (merge (m/default-schemas) malli-registry))
 
@@ -152,9 +148,6 @@
 
 (def explain-event-definition
   (m/explainer (m/schema ::EventDefinition {:registry full-malli-registry})))
-
-(def explain-interceptor-definition
-  (m/explainer (m/schema ::InterceptorDefinition {:registry full-malli-registry})))
 
 (defn- register [env kind name m]
   (assoc-in env [kind name] m))
@@ -174,17 +167,16 @@
     (::query invocation) (lookup env ::query (::query invocation))
     (::event invocation) (lookup env ::event (::event invocation))
     (::effect invocation) (lookup env ::effect (::effect invocation))
-    (::interceptor invocation) (lookup env ::interceptor (::interceptor invocation))
     :else (throw (ex-info "Unrecognized invocation" {:invocation invocation}))))
 
 (def ^:private ^:dynamic *env* nil)
 
 (def ^:dynamic *check-definition-schemas*
-  "Whether to check the schema of effect, query, interceptor, and event definitions"
+  "Whether to check the schema of effect, query, and event definitions"
   true)
 
 (def ^:dynamic *check-invocation-schemas*
-  "Whether to check the schema of effect, query, interceptor, and event invocations"
+  "Whether to check the schema of effect, query, and event invocations"
   true)
 
 (def ^:private ^:dynamic *pending-invocations* #{})
@@ -454,40 +446,6 @@
    (let [effects (normalize-effect-invocations effects)]
      (effects-seq! env effects))))
 
-;; Interceptors --
-
-(defn- add-interceptor-invocation-explainer [interceptor-def]
-  (let [invocation-schema (m/schema ::InterceptorInvocation {:registry full-malli-registry})
-        invocation-explainer (m/explainer
-                              (if-let [p (::params-schema interceptor-def)]
-                                (mu/merge invocation-schema [:map [::params (m/schema p)]])
-                                invocation-schema))]
-    (assoc interceptor-def ::explainer invocation-explainer)))
-
-(defn register-interceptor
-  "Add an interceptor to `env`"
-  [env name m]
-  (when *check-definition-schemas*
-    (when-let [explain (explain-interceptor-definition m)]
-      (throw (ex-info "Invalid interceptor definition" explain))))
-  (register env ::interceptor name (-> m (add-interceptor-invocation-explainer))))
-
-(defn register-interceptor!
-  "Add an interceptor to `env*`"
-  ([name m] (register-interceptor! default-env* name m))
-  ([env* name m]
-   (swap! env* register-interceptor name m)))
-
-(defn get-interceptor [env interceptor-id]
-  (lookup env ::interceptor interceptor-id))
-
-(defn terminate
-  "Terminate an interceptor chain with some effects."
-  [ctx effects]
-  (-> ctx
-      (assoc ::effects effects)
-      (ei/terminate)))
-
 ;; -- Events --
 
 (defn- add-event-invocation-explainer [event-def]
@@ -515,72 +473,75 @@
 (defn get-event [env event-id]
   (lookup env ::event event-id))
 
-(defn- event-def->interceptor [event-def event-invocation]
-  (let [impl      (::impl event-def)
-        queries (::queries event-def)]
-    {:enter (cond-> {::impl (fn [{::keys [env query-results]
-                                  :as ctx}]
-                              (let [fx (impl env
-                                             (::params event-invocation)
-                                             query-results)]
-                                (update ctx ::effects
-                                        (fn [xs]
-                                          (into (normalize-effect-invocations xs)
-                                                (normalize-effect-invocations fx))))))}
-              queries (assoc ::queries queries))}))
-
 (defn- make-interceptor-ctx-handler [phase params]
   (let [{::keys [impl queries]} phase]
     (fn [{::keys [env] :as ctx}]
-      (let [ctx (assoc ctx
-                       ::params params
-                       ::query-results (execute-dependency-queries env params queries))]
+      (let [ctx (assoc ctx ::query-results (execute-dependency-queries env params queries))]
         (impl ctx)))))
 
 (defn- make-interceptor-error-handler [phase params]
   (let [{::keys [impl queries]} phase]
     (fn [{::keys [env] :as ctx} err]
-      (let [ctx (assoc ctx
-                       ::params params
-                       ::query-results (execute-dependency-queries env params queries))]
+      (let [ctx (assoc ctx ::query-results (execute-dependency-queries env params queries))]
         (impl ctx err)))))
+
+(defn- event-def->interceptor [event-def event-invocation]
+  (let [impl      (::impl event-def)
+        queries (::queries event-def)
+        params (::params event-invocation)
+        enter (cond-> {::impl (fn [{::keys [env query-results]
+                                    :as ctx}]
+                                (let [fx (impl env
+                                               params
+                                               query-results)]
+                                  (update ctx ::effects
+                                          (fn [xs]
+                                            (into (normalize-effect-invocations xs)
+                                                  (normalize-effect-invocations fx))))))}
+                queries (assoc ::queries queries))]
+    {:enter (make-interceptor-ctx-handler enter params)}))
+
+(defn lower-interceptor
+  "Given an interceptor definition as understood by Ometh, return a regular interceptor
+  as understood by exoscale.interceptor"
+  [def]
+  (cond-> {}
+    (::enter def) (assoc :enter (make-interceptor-ctx-handler (::enter def) nil))
+    (::leave def) (assoc :leave (make-interceptor-ctx-handler (::leave def) nil))
+    (::error def) (assoc :error (make-interceptor-error-handler (::error def) nil))))
+
+(defn lift-interceptor
+  "Given a regular interceptor as understood by exoscale.interceptor, return an interceptor
+  definition as understood by Ometh."
+  [i]
+  (cond-> {}
+    (:enter i) (assoc ::enter {::impl (:enter i)})
+    (:leave i) (assoc ::leave {::impl (:leave i)})
+    (:error i) (assoc ::error {::impl (:error i)})))
 
 (defn- make-event-interceptor-chain [env event-invocation]
   (let [event-id (::event event-invocation)
         event-def (get-event env event-id)
         params    (::params event-invocation)
         event-interceptors (->> (or (::interceptors event-def) [])
-                                (mapcat (fn [invocation-or-fn]
-                                          (if (fn? invocation-or-fn)
-                                            (let [x (invocation-or-fn params)]
-                                              (if (map? x) [x] x))
-                                            [invocation-or-fn])))
-                                (mapv (fn [{::keys [interceptor] :as invocation}]
-                                        {:def (get-interceptor env interceptor)
-                                         :invocation invocation})))
-        _ (when *check-invocation-schemas*
-            (doseq [{:keys [def invocation]} event-interceptors]
-              (when-let [explain (when-let [f (::explainer def)] (f invocation))]
-                (throw (ex-info "Invalid interceptor invocation"
-                                (assoc explain
-                                       ::kind :invalid-interceptor-invocation
-                                       ::category :incorrect))))))]
-    (-> event-interceptors
-        (conj {:def (event-def->interceptor event-def event-invocation)
-               :invocation event-invocation})
-        (->> (mapv (fn [{:keys [def invocation]}]
-                     (let [params (::params invocation)]
-                       ;; Turn it into an interceptor as understood by exoscale.interceptor.
-                       (cond-> {}
-                         (:enter def)
-                         (assoc :enter (make-interceptor-ctx-handler (:enter def)
-                                                                     params))
-                         (:leave def)
-                         (assoc :leave (make-interceptor-ctx-handler (:leave def)
-                                                                     params))
-                         (:error def)
-                         (assoc :error (make-interceptor-error-handler (:error def)
-                                                                       params))))))))))
+                                (mapcat (fn [def-or-fn]
+                                          ;; If a function of the event's parameters is
+                                          ;; provided, the return value of that fn is
+                                          ;; nil (no interceptors)
+                                          ;; a map (1 interceptor)
+                                          ;; or a seq (n interceptors)
+                                          (if (fn? def-or-fn)
+                                            (let [x (def-or-fn params)]
+                                              (cond
+                                                (nil? x) []
+                                                (map? x) [x]
+                                                (sequential? x) x
+                                                :else (throw (ex-info "Invalid interceptors"
+                                                                      {:interceptors x}))))
+                                            [def-or-fn])))
+                                (mapv lower-interceptor))
+        event-impl-as-interceptor (event-def->interceptor event-def event-invocation)]
+    (conj event-interceptors event-impl-as-interceptor)))
 
 (defn handle-event!
   "Handle an event invocation by:
@@ -639,6 +600,16 @@
   This is the atom mutated by default when registering effects, queries, and events."
   (atom (make-default-env)))
 
+;; -- Interceptor Helpers
+
+(defn terminate
+  "Terminate an interceptor chain, optionally with some effects."
+  ([ctx] (-> ctx (ei/terminate)))
+  ([ctx effects]
+   (-> ctx
+       (assoc ::effects effects)
+       (ei/terminate))))
+
 ;; -- Convenience Constructors
 
 (defn ->query
@@ -660,11 +631,6 @@
   "Construct an event invocation"
   ([name] {::event name})
   ([name params] {::event name ::params params}))
-
-(defn ->interceptor
-  "Construct an interceptor invocation"
-  ([name] {::interceptor name})
-  ([name params] {::interceptor name ::params params}))
 
 ;; -- Convenience Register-ers.
 
@@ -770,31 +736,3 @@
                   (throw (ex-info (str "Invalid arglist for defevent impl function."
                                        " Must provide 2 or 3 args.")
                                   {:arglist impl-params}))))))))
-
-(def ^:private definterceptor-args-schema
-  [:catn
-   [:docstring [:? :string]]
-   [:def-map  (m/schema ::InterceptorDefinition {:registry full-malli-registry})]])
-
-(defmacro definterceptor
-  "Define an interceptor.
-  Registers the interceptor in the default or given ::env* atom.
-  Defines a function ->{interceptor-name} to construct invocations of it.
-  Defines a var {event-name} holding the given body."
-  [interceptor-name & args]
-  (let [parse-result (m/parse definterceptor-args-schema args)
-        _ (when (= ::m/invalid parse-result)
-            (throw (ex-info "Invalid definterceptor args"
-                            (m/explain definterceptor-args-schema args))))
-        {:keys [docstring def-map]} (:values parse-result)
-        handler-name-kw (keyword (name (ns-name *ns*)) (name interceptor-name))]
-    `(do
-       (defn ~(-> (str "->" interceptor-name) symbol)
-         ~@(when docstring [docstring])
-         ([] (com.knowclick.ometh/->interceptor ~handler-name-kw))
-         ([params#] (com.knowclick.ometh/->interceptor ~handler-name-kw params#)))
-       (def ~interceptor-name ~@(when docstring [docstring]) ~def-map)
-       (com.knowclick.ometh/register-interceptor!
-        ~(or (:com.knowclick.ometh/env* def-map) 'com.knowclick.ometh/default-env*)
-        ~handler-name-kw
-        ~interceptor-name))))

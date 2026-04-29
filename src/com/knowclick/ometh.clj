@@ -665,13 +665,13 @@
         ~handler-name-kw
         ~(assoc attr-map :com.knowclick.ometh/impl
                 (case (count impl-params)
-                  1 `(fn [_env# params# _query-results#]
-                       (~handler-name params#))
+                  1 `(fn [env# _params# _query-results#]
+                       (~handler-name env#))
                   2 `(fn [env# params# _query-results#]
                        (~handler-name env# params#))
                   3 `(var ~handler-name)
                   (throw (ex-info (str "Invalid arglist for defquery impl function."
-                                       " Must provide 2 or 3 args.")
+                                       " Must provide 1-3 args.")
                                   {:arglist impl-params}))))))))
 
 (defmacro defeffect
@@ -699,11 +699,13 @@
         ~handler-name-kw
         ~(assoc attr-map :com.knowclick.ometh/impl
                 (case (count impl-params)
+                  1 `(fn [env# _params# _query-results#]
+                       (~handler-name env#))
                   2 `(fn [env# params# _query-results#]
                        (~handler-name env# params#))
                   3 `(var ~handler-name)
                   (throw (ex-info (str "Invalid arglist for defeffect impl function."
-                                       " Must provide 2 or 3 args.")
+                                       " Must provide 1-3 args.")
                                   {:arglist impl-params}))))))))
 
 (defmacro defevent
@@ -730,9 +732,11 @@
         ~handler-name-kw
         ~(assoc attr-map :com.knowclick.ometh/impl
                 (case (count impl-params)
+                  1 `(fn [env# _params# _query-results#]
+                       (~handler-name env#))
                   2 `(fn [env# params# _query-results#]
                        (~handler-name env# params#))
                   3 `(var ~handler-name)
                   (throw (ex-info (str "Invalid arglist for defevent impl function."
-                                       " Must provide 2 or 3 args.")
+                                       " Must provide 1-3 args.")
                                   {:arglist impl-params}))))))))

@@ -229,9 +229,9 @@ So far we've been invoking and defining events and effects the verbose way. Ther
 - define a `->{name}` function to construct invocations of the effect/event/query
 - define a `{name}` function which is used as the ::o/impl for the effect/event/query
   - this means that we can call `request-booking` exactly like we could when it was a normal function; it is still the same normal function.
-- add to the env the effect/event/query, identified by the namespaced keyword name.
+- register the effect/event/query, identified by the namespaced keyword name.
 
-Note that in the above, the `env` is implicit; Ometh defines a `default-env*` that will probably be sufficient for most use cases. You can also pass `::o/env*` to these macros to use a different env atom.
+Note that in the above, the `env*` is implicit; Ometh defines a `default-env*` that will probably be sufficient for most use cases. You can also pass `::o/env*` to these macros to use a different env atom.
 
 
 ### Clean Reads
@@ -441,3 +441,4 @@ Finally, Ometh provides `terminate` for the common interceptor use case of termi
 - Include retry logic when necessary in effect definitions, rather than trying to dispatch effects/events for retries.
 - Keep effects minimal and rely on `::o/on-success` for chaining effects which must happen in sequence.
 - Queries should return as little data as possible. This makes testing easier.
+- When using Ometh to process events delivered by http requests, the http request handler should be responsible for turning request params into clojure data (e.g. JSON or query string parsing); this is schema-agnostic. Ometh events are responsible for decoding and validating the schema of the event parameters, probably using a `decode` interceptor that creates a Malli `decoder` or `coercer`.

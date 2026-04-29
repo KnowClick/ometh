@@ -473,42 +473,42 @@
 (defn get-event [env event-id]
   (lookup env ::event event-id))
 
-(defn- make-interceptor-ctx-handler [phase params]
+(defn- make-interceptor-ctx-handler [phase]
   (let [{::keys [impl queries]} phase]
-    (fn [{::keys [env] :as ctx}]
-      (let [ctx (assoc ctx ::query-results (execute-dependency-queries env params queries))]
+    (fn [{::keys [env event-invocation] :as ctx}]
+      (let [params (::params event-invocation)
+            ctx (assoc ctx ::query-results (execute-dependency-queries env params queries))]
         (impl ctx)))))
 
-(defn- make-interceptor-error-handler [phase params]
+(defn- make-interceptor-error-handler [phase]
   (let [{::keys [impl queries]} phase]
-    (fn [{::keys [env] :as ctx} err]
-      (let [ctx (assoc ctx ::query-results (execute-dependency-queries env params queries))]
+    (fn [{::keys [env event-invocation] :as ctx} err]
+      (let [params (::params event-invocation)
+            ctx (assoc ctx ::query-results (execute-dependency-queries env params queries))]
         (impl ctx err)))))
 
-(defn- event-def->interceptor [event-def event-invocation]
-  (let [impl      (::impl event-def)
+(defn- event-def->interceptor [event-def]
+  (let [impl    (::impl event-def)
         queries (::queries event-def)
-        params (::params event-invocation)
-        enter (cond-> {::impl (fn [{::keys [env query-results]
+        enter (cond-> {::impl (fn [{::keys [env query-results event-invocation]
                                     :as ctx}]
-                                (let [fx (impl env
-                                               params
-                                               query-results)]
+                                (let [params (::params event-invocation)
+                                      fx (impl env params query-results)]
                                   (update ctx ::effects
                                           (fn [xs]
                                             (into (normalize-effect-invocations xs)
                                                   (normalize-effect-invocations fx))))))}
                 queries (assoc ::queries queries))]
-    {:enter (make-interceptor-ctx-handler enter params)}))
+    {:enter (make-interceptor-ctx-handler enter)}))
 
 (defn lower-interceptor
   "Given an interceptor definition as understood by Ometh, return a regular interceptor
   as understood by exoscale.interceptor"
   [def]
   (cond-> {}
-    (::enter def) (assoc :enter (make-interceptor-ctx-handler (::enter def) nil))
-    (::leave def) (assoc :leave (make-interceptor-ctx-handler (::leave def) nil))
-    (::error def) (assoc :error (make-interceptor-error-handler (::error def) nil))))
+    (::enter def) (assoc :enter (make-interceptor-ctx-handler (::enter def)))
+    (::leave def) (assoc :leave (make-interceptor-ctx-handler (::leave def)))
+    (::error def) (assoc :error (make-interceptor-error-handler (::error def)))))
 
 (defn lift-interceptor
   "Given a regular interceptor as understood by exoscale.interceptor, return an interceptor
@@ -540,7 +540,7 @@
                                                                       {:interceptors x}))))
                                             [def-or-fn])))
                                 (mapv lower-interceptor))
-        event-impl-as-interceptor (event-def->interceptor event-def event-invocation)]
+        event-impl-as-interceptor (event-def->interceptor event-def)]
     (conj event-interceptors event-impl-as-interceptor)))
 
 (defn handle-event!
@@ -667,8 +667,8 @@
                 (case (count impl-params)
                   1 `(fn [_env# params# _query-results#]
                        (~handler-name params#))
-                  2 `(fn [_env# params# query-results#]
-                       (~handler-name params# query-results#))
+                  2 `(fn [env# params# _query-results#]
+                       (~handler-name env# params#))
                   3 `(var ~handler-name)
                   (throw (ex-info (str "Invalid arglist for defquery impl function."
                                        " Must provide 2 or 3 args.")
